@@ -1,19 +1,20 @@
-// todo
-// 1. 自动把要发版的组件添加到 entry.js 文件内
-// 2. 编译 css
-// 3. 生成 changelog
-// 4. 提交前自动 git add . 所有文件
-
+const { prompt } = require('enquirer')
+const path = require('path')
+const fs = require('fs')
+const args = require('minimist')(process.argv.slice(2))
+const targetVersion = args.v
 const execa = require('execa')
 const chalk = require('chalk')
-const args = require('minimist')(process.argv.slice(2))
-const { prompt } = require('enquirer')
+const isDryRun = args.dry
 
 const step = (msg) => console.log(chalk.cyan(msg))
+const run = (bin, args, opts = {}) =>
+  execa(bin, args, { stdio: 'inherit', ...opts })
+const dryRun = (bin, args, opts = {}) =>
+  console.log(chalk.blue(`[dryrun] ${bin} ${args.join(' ')}`), opts)
+const runIfNotDry = isDryRun ? dryRun : run
 
-async function main() {
-  const targetVersion = args.v
-
+;(async function main() {
   const { yes } = await prompt({
     type: 'confirm',
     name: 'yes',
@@ -22,31 +23,93 @@ async function main() {
 
   if (!yes) return
 
-  step('\nBuilding...')
-  await execa('npm', ['run', 'build:next'])
+  step('\nRunning element3 tests...')
+  await run('yarn', ['workspace', 'element3', 'test'])
 
-  step('\nRun Tests')
-  await execa('npm', ['run', 'test:unit'])
+  step('\nBuilding element3...')
+  await run('yarn', ['workspace', 'element3', 'build'])
 
-  step('\nUpdate version...')
-  await execa('npm', [
+  step('\nUpdate element3 version...')
+  await run('yarn', [
+    'workspace',
+    'element3',
     'version',
+    '--new-version',
     targetVersion,
-    '--message',
-    `build: release v${targetVersion}`
+    '--no-git-tag-version'
   ])
 
-  step('\nPublishing package...')
-  await execa('npm', ['publish', '--registry', 'https://registry.npmjs.org'])
+  step('\nUpdating element3 cross dependencies...')
+  updatePackageVersion(targetVersion)
+
+  const { stdout } = await run('git', ['diff'], { stdio: 'pipe' })
+  if (stdout) {
+    step('\nCommitting changes...')
+    await runIfNotDry('git', ['add', '-A'])
+    await runIfNotDry('git', ['commit', '-m', `release: v${targetVersion}`])
+  } else {
+    console.log('No changes to commit.')
+  }
+
+  step('\nPublishing element3 package...')
+
+  await runIfNotDry(
+    'yarn',
+    [
+      'publish',
+      '--new-version',
+      targetVersion,
+      '--registry',
+      'https://registry.npmjs.org',
+      '--access',
+      'public'
+    ],
+    {
+      cwd: path.resolve(__dirname, '../packages/element3'),
+      stdio: 'pipe'
+    }
+  )
 
   step('\nPushing to GitHub...')
-  await execa('git', ['push', 'origin', 'master', '--no-verify'])
-  await execa('git', ['push', 'origin', `v${targetVersion}`, '--no-verify'])
+  await runIfNotDry('git', ['tag', `v${targetVersion}`])
+  await runIfNotDry('git', [
+    'push',
+    'origin',
+    `refs/tags/v${targetVersion}`,
+    '--no-verify'
+  ])
+  await runIfNotDry('git', ['push', 'origin', 'master', '--no-verify'])
 
   console.log()
   console.log(chalk.green(`Successfully published v${targetVersion}`))
+})()
+
+function updatePackageVersion(version) {
+  getPackagePath().forEach((pkgPath) => {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath))
+    updateDeps(pkg, 'dependencies', version)
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n')
+  })
 }
 
-main().catch((err) => {
-  console.error(err)
-})
+function getPackagePath() {
+  const pkgRoot = path.resolve(__dirname, '../packages')
+  const packages = fs
+    .readdirSync(pkgRoot)
+    .filter((name) => !name.startsWith('.'))
+
+  return packages.map((packageName) =>
+    path.resolve(pkgRoot, packageName, 'package.json')
+  )
+}
+
+function updateDeps(packageJson, depType, version) {
+  const dependencies = packageJson[depType]
+  if (!dependencies) return
+
+  Object.keys(dependencies).forEach((key) => {
+    if (key === 'element3') {
+      dependencies[key] = version
+    }
+  })
+}
